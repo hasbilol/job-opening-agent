@@ -28,9 +28,42 @@ _JOB_BOARD_SITES = (
     "site:greenhouse.io",
     "site:lever.co",
     "site:myworkdayjobs.com",
+    "site:my.jobstreet.com",
+    "site:jobstreet.com.my",
     "site:linkedin.com/jobs",
-    "site:jobstreet.",
 )
+
+# Geographic expansions so "Kuala Lumpur" also accepts jobs posted in the wider
+# Klang Valley tech corridor, and "Penang" accepts the island's tech belt.
+_REGION_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "kuala lumpur": (
+        "kuala lumpur",
+        "klcc",
+        "bangsar",
+        "petaling jaya",
+        "selangor",
+        "cyberjaya",
+        "shah alam",
+        "subang jaya",
+        "klang valley",
+        "greater kl",
+        "mont kiara",
+        "putrajaya",
+        "ampang",
+        "cheras",
+        "kota damansara",
+    ),
+    "penang": (
+        "penang",
+        "george town",
+        "georgetown",
+        "bayan lepas",
+        "kulim",
+        "seberang perai",
+        "butterworth",
+        "tanjung bungah",
+    ),
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -203,6 +236,50 @@ def _title_key(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
 
 
+def _location_signals(target_locations: str) -> list[str]:
+    """Expand a location string into matchable signals.
+
+    ``"Kuala Lumpur, Malaysia; Penang, Malaysia"`` becomes the literal parts plus
+    the Klang Valley / Penang tech-belt expansions from `_REGION_EXPANSIONS`.
+    """
+    parts = [
+        part.strip().lower()
+        for part in re.split(r"[,;]", target_locations or "")
+        if part.strip()
+    ]
+    signals: list[str] = []
+
+    def add(value: str) -> None:
+        value = value.strip().lower()
+        if value and value not in signals:
+            signals.append(value)
+
+    for part in parts:
+        add(part)
+        for region, expansions in _REGION_EXPANSIONS.items():
+            if region in part:
+                for expansion in expansions:
+                    add(expansion)
+    return signals
+
+
+def _mentions_location(text: str, signals: list[str]) -> bool:
+    """True when any signal appears in ``text`` (word-boundary safe for short ones)."""
+    text = text.lower()
+    for signal in signals:
+        if len(signal) <= 4:
+            if re.search(rf"\b{re.escape(signal)}\b", text):
+                return True
+        elif signal in text:
+            return True
+    return False
+
+
+def _remote_allowed(target_locations: str) -> bool:
+    """Remote-only roles pass only when 'Remote' is part of the target locations."""
+    return "remote" in (target_locations or "").lower()
+
+
 # --------------------------------------------------------------------------- #
 # Structured scoring schema
 # --------------------------------------------------------------------------- #
@@ -211,6 +288,10 @@ class JobMatchScore(BaseModel):
     rationale: str = Field(description="Two-sentence explanation of the fit")
     matched_skills: list[str] = Field(default_factory=list)
     missing_or_gap_skills: list[str] = Field(default_factory=list)
+    job_location: str = Field(
+        default="",
+        description="Location as written on the posting, e.g. 'Kuala Lumpur, Malaysia'",
+    )
 
     @field_validator("match_score", mode="before")
     @classmethod
@@ -257,7 +338,12 @@ def planner(
                 "{boards} plus regional boards (JobStreet, LinkedIn Jobs) where relevant.\n"
                 "3. Prefer quoted phrases and recent-active-posting phrasing, e.g. "
                 '"Senior Python Engineer" "Singapore" site:greenhouse.io hiring 2026.\n'
-                "4. No commentary, no markdown fences - raw JSON array only."
+                "4. Reserve one query for a regional board using its exact site: operator, "
+                "e.g. site:my.jobstreet.com or site:jobstreet.com.my for Malaysia, or "
+                "site:linkedin.com/jobs.\n"
+                "5. Never include 'remote worldwide' or 'work from anywhere' phrasing unless "
+                "the target locations explicitly say Remote.\n"
+                "6. No commentary, no markdown fences - raw JSON array only."
             ).format(
                 roles=roles,
                 locations=locations,
@@ -306,6 +392,10 @@ def searcher(
     client = TavilyClient(api_key=cfg.tavily_api_key)
     max_results = cfg.max_results_per_query
 
+    locations = state.get("target_locations") or cfg.target_locations
+    signals = _location_signals(locations)
+    remote_ok = _remote_allowed(locations)
+
     seen: dict[str, dict] = {}
     seen_titles: set[str] = set()
     skipped = 0
@@ -335,6 +425,14 @@ def searcher(
                 skipped += 1
                 logger.debug("Skipping non-posting result %r (%s)", title, url)
                 continue
+            if signals:
+                haystack = f"{title} {snippet} {url}".lower()
+                located = _mentions_location(haystack, signals)
+                remote_match = remote_ok and bool(re.search(r"\bremote\b", haystack))
+                if not located and not remote_match:
+                    skipped += 1
+                    logger.debug("Skipping out-of-area result %r (%s)", title, url)
+                    continue
             title_key = _title_key(title)
             if title_key in seen_titles:
                 skipped += 1
@@ -362,7 +460,7 @@ def searcher(
 # --------------------------------------------------------------------------- #
 # Node 3: matcher / scorer
 # --------------------------------------------------------------------------- #
-def _scoring_messages(resume: str, jobs: list[dict]) -> list:
+def _scoring_messages(resume: str, jobs: list[dict], locations: str) -> list:
     catalogue = [
         {
             "id": index,
@@ -385,16 +483,23 @@ def _scoring_messages(resume: str, jobs: list[dict]) -> list:
             content=(
                 "CANDIDATE RESUME:\n{resume}\n\n"
                 "JOB POSTINGS (JSON):\n{jobs}\n\n"
+                "Accepted locations for this search: {locations}\n\n"
                 "For EVERY job id, return ONLY a JSON array (no markdown fences) of objects with:\n"
                 '  "id": the original integer id,\n'
                 '  "match_score": integer 0-100,\n'
                 '  "rationale": exactly 2 sentences explaining the fit,\n'
                 '  "matched_skills": array of skills from the resume that the posting requires,\n'
-                '  "missing_or_gap_skills": array of required skills the resume lacks.\n'
-                "Include every id exactly once."
+                '  "missing_or_gap_skills": array of required skills the resume lacks,\n'
+                '  "job_location": the posting\'s location as written (e.g. "Kuala Lumpur, '
+                'Malaysia"), or "" if none is stated.\n'
+                "Include every id exactly once.\n"
+                "Location rule: a posting must be based in an accepted location to score "
+                "well. Score anything based elsewhere below 50, and score a fully remote "
+                "role outside the accepted locations below 50 too."
             ).format(
                 resume=resume[:_RESUME_LIMIT] or "(no resume provided)",
                 jobs=json.dumps(catalogue, ensure_ascii=False),
+                locations=locations or "(any)",
             )
         ),
     ]
@@ -435,11 +540,16 @@ def matcher(
     cfg = _resolve(settings)
     jobs: list[dict] = state["raw_jobs"]
     expected_ids = set(range(len(jobs)))
+    locations = state.get("target_locations") or cfg.target_locations
+    signals = _location_signals(locations)
+    remote_ok = _remote_allowed(locations)
 
     scores: dict[int, JobMatchScore] = {}
     try:
         response = _message_text(
-            _generate(cfg, _scoring_messages(state.get("resume_text", ""), jobs))
+            _generate(
+                cfg, _scoring_messages(state.get("resume_text", ""), jobs, locations)
+            )
         )
         scores = _parse_scores(response, expected_ids)
         if len(scores) < len(jobs):
@@ -453,7 +563,10 @@ def matcher(
             continue
         try:
             response = _message_text(
-                _generate(cfg, _scoring_messages(state.get("resume_text", ""), [job]))
+                _generate(
+                    cfg,
+                    _scoring_messages(state.get("resume_text", ""), [job], locations),
+                )
             )
             individual = _parse_scores(response, {index})
             if index in individual:
@@ -470,6 +583,18 @@ def matcher(
             continue
         if score.match_score < cfg.match_threshold:
             continue
+        if signals and score.job_location:
+            location_text = score.job_location.lower()
+            located = _mentions_location(location_text, signals)
+            remote_match = remote_ok and bool(re.search(r"\bremote\b", location_text))
+            if not located and not remote_match:
+                logger.info(
+                    "Dropping %r: location %r outside %s",
+                    job.get("title"),
+                    score.job_location,
+                    locations,
+                )
+                continue
         matches.append(
             {
                 "title": job.get("title", "Untitled role"),

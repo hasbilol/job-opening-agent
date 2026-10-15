@@ -38,8 +38,8 @@ jobs:
       # repository secret. Falls back to the placeholder resume.txt otherwise.
       RESUME_TEXT: ${{ secrets.RESUME_TEXT }}
       RESUME_B64: ${{ secrets.RESUME_B64 }}
-      TARGET_ROLES: ${{ inputs.roles || vars.TARGET_ROLES || 'Backend Engineer, Machine Learning Engineer, Full Stack Developer' }}
-      TARGET_LOCATIONS: ${{ inputs.locations || vars.TARGET_LOCATIONS || 'Singapore, Remote (APAC)' }}
+      TARGET_ROLES: ${{ inputs.roles || vars.TARGET_ROLES || secrets.TARGET_ROLES || 'Backend Engineer, Machine Learning Engineer, Full Stack Developer' }}
+      TARGET_LOCATIONS: ${{ inputs.locations || vars.TARGET_LOCATIONS || secrets.TARGET_LOCATIONS || 'Kuala Lumpur, Malaysia; Penang, Malaysia' }}
 
     steps:
       - name: Checkout repository
