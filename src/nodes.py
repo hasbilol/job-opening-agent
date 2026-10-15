@@ -428,6 +428,8 @@ def planner(
                 break
 
     logger.info("Planner produced %d queries", len(queries))
+    for query in queries[:3]:
+        logger.info("  query: %s", query)
     state["queries"] = queries[:3]
     return state
 
@@ -455,7 +457,11 @@ def searcher(
 
     seen: dict[str, dict] = {}
     seen_titles: set[str] = set()
-    skipped = 0
+    skipped: dict[str, int] = {
+        "not_a_posting": 0,
+        "out_of_area": 0,
+        "duplicate_title": 0,
+    }
     failures = 0
     for query in state["queries"]:
         try:
@@ -479,7 +485,7 @@ def searcher(
                 result.get("content") or result.get("raw_content") or ""
             ).strip()
             if not _looks_like_posting(url, title, snippet):
-                skipped += 1
+                skipped["not_a_posting"] += 1
                 logger.debug("Skipping non-posting result %r (%s)", title, url)
                 continue
             if signals:
@@ -487,12 +493,12 @@ def searcher(
                 located = _mentions_location(haystack, signals)
                 remote_match = remote_ok and bool(re.search(r"\bremote\b", haystack))
                 if not located and not remote_match:
-                    skipped += 1
+                    skipped["out_of_area"] += 1
                     logger.debug("Skipping out-of-area result %r (%s)", title, url)
                     continue
             title_key = _title_key(title)
             if title_key in seen_titles:
-                skipped += 1
+                skipped["duplicate_title"] += 1
                 continue
             seen_titles.add(title_key)
             seen[url] = {
@@ -507,9 +513,9 @@ def searcher(
         state["error"] = f"searcher: all {failures} Tavily queries failed"
         logger.error("%s", state["error"])
     logger.info(
-        "Searcher collected %d unique postings (%d results skipped as index pages or duplicates)",
+        "Searcher collected %d unique postings (skipped: %s)",
         len(state["raw_jobs"]),
-        skipped,
+        ", ".join(f"{k}={v}" for k, v in skipped.items() if v) or "none",
     )
     return state
 
@@ -634,18 +640,27 @@ def matcher(
             logger.warning("Scoring failed for %r: %s", job.get("title"), exc)
 
     matches: list[dict] = []
+    dropped_low, dropped_area = 0, 0
     for index, job in enumerate(jobs):
         score = scores.get(index)
         if score is None:
             continue
         if score.match_score < cfg.match_threshold:
+            dropped_low += 1
+            logger.debug(
+                "Below threshold: %d < %d -- %r",
+                score.match_score,
+                cfg.match_threshold,
+                job.get("title"),
+            )
             continue
         if signals and score.job_location:
             location_text = score.job_location.lower()
             located = _mentions_location(location_text, signals)
             remote_match = remote_ok and bool(re.search(r"\bremote\b", location_text))
             if not located and not remote_match:
-                logger.info(
+                dropped_area += 1
+                logger.debug(
                     "Dropping %r: location %r outside %s",
                     job.get("title"),
                     score.job_location,
@@ -669,10 +684,12 @@ def matcher(
         state["error"] = "matcher: no postings could be scored"
         logger.error("%s", state["error"])
     logger.info(
-        "Matcher kept %d/%d postings at or above %d%%",
+        "Matcher kept %d/%d postings at or above %d%% (below=%d, out_of_area=%d)",
         len(matches),
         len(jobs),
         cfg.match_threshold,
+        dropped_low,
+        dropped_area,
     )
     return state
 
