@@ -254,15 +254,21 @@ _JUNK_TITLE_RE = re.compile(
 )
 
 # JobStreet (and similar aggregators) expose category landing pages at URLs that look
-# like postings -- "/jobs-in-Kuala-Lumpur", "/all-jobs" -- but only contain listings,
-# not requirements. Real JobStreet postings live under a /job/segment with a numeric id.
-_LISTING_PATH_RE = re.compile(
-    r"/(jobs?|careers?|vacanc(?:y|ies))(-in-[a-z0-9-]+)?$"
-    r"|/(all|search|latest|browse|category|categories)[-_]?"
-    r"(jobs?|roles?|positions?|openings?)",
+# like postings -- "/node-jobs-in-cheras", "/backend-engineer-jobs-in-kuala-lumpur" --
+# but only contain listings, not requirements. A real JobStreet posting lives under a
+# single /job/<slug>-<id> segment, so any path that is NOT that shape is a category page
+# on an aggregator host and cannot be scored.
+_JOB_SLUG_ID_RE = re.compile(r"^/job/[a-z0-9-]+-\d{4,}/?$", re.IGNORECASE)
+# Other boards (Lever, Greenhouse, Workday) use their own posting paths; these are the
+# shapes known to be a single posting rather than a listing index.
+_BOARD_POSTING_RE = re.compile(
+    r"^/(?:jobs?|positions?|openings?)/(?:view/)?[a-z0-9-]*\d{4,}/?$",
     re.IGNORECASE,
 )
-_NUMERIC_ID_RE = re.compile(r"/(\d{5,})(?:[/?#]|$)")
+_AGGREGATOR_HOST_RE = re.compile(
+    r"(?:^|\.)jobstreet\.|linkedin\.com$|indeed\.|glassdoor\.",
+    re.IGNORECASE,
+)
 
 
 def _looks_like_posting(url: str, title: str, snippet: str) -> bool:
@@ -279,9 +285,12 @@ def _looks_like_posting(url: str, title: str, snippet: str) -> bool:
     # index pages are the domain root or a single locale/marketing segment.
     if len(segments) < 2:
         return False
-    # A category/listing shell ("Backend Jobs in Kuala Lumpur") is not a posting even
-    # when its URL has two segments. Only let it through if the URL carries a posting id.
-    if _LISTING_PATH_RE.search(parsed.path) and not _NUMERIC_ID_RE.search(parsed.path):
+    # Aggregators (JobStreet, LinkedIn, Indeed) publish category pages at paths that
+    # look like postings. On those hosts only a single known posting shape is trusted;
+    # elsewhere the two-segment rule above already filtered the index pages.
+    if _AGGREGATOR_HOST_RE.search(parsed.netloc) and not (
+        _JOB_SLUG_ID_RE.match(parsed.path) or _BOARD_POSTING_RE.match(parsed.path)
+    ):
         return False
     return len(snippet) >= 30
 
