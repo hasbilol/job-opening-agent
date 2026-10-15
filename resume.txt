@@ -1,0 +1,35 @@
+JANE DOE
+Singapore | jane.doe@example.com | +65 8000 1234 | github.com/janedoe | linkedin.com/in/janedoe
+
+SUMMARY
+Software engineer with 4 years of experience building backend services, data pipelines,
+and machine learning applications. Comfortable owning features end-to-end, from design
+through deployment and monitoring.
+
+SKILLS
+- Languages: Python, TypeScript, Go, SQL
+- Backend: FastAPI, Flask, Django, Node.js, REST, GraphQL
+- ML / Data: PyTorch, scikit-learn, pandas, NumPy, LangChain, LangGraph
+- Cloud & Infra: AWS (EC2, S3, Lambda, RDS), Docker, Kubernetes, Terraform, GitHub Actions
+- Databases: PostgreSQL, MongoDB, Redis
+- Practices: CI/CD, unit/integration testing, observability, Agile
+
+EXPERIENCE
+
+Software Engineer — Acme Pte Ltd, Singapore (Jan 2022 – Present)
+- Designed and shipped a FastAPI microservice handling 2M+ requests/day with 99.9% uptime.
+- Built an ETL pipeline in Python moving 500GB/day from S3 into PostgreSQL + dbt.
+- Deployed a gradient-boosting churn model that reduced customer churn by 12%.
+- Led migration of legacy monolith to Docker/Kubernetes on AWS, cutting deploy time 70%.
+
+Junior Developer — Beta Labs, Remote (Jun 2020 – Dec 2021)
+- Developed React/Node.js dashboards used by 10k+ monthly users.
+- Automated release workflows with GitHub Actions, removing manual QA handoffs.
+- Wrote integration tests raising backend coverage from 45% to 85%.
+
+EDUCATION
+B.Sc. Computer Science, National University of Singapore, 2020
+
+PROJECTS
+- Job Opening Agent: LangGraph + Gemini agent that scrapes job boards and emails a daily digest.
+- Realtime Chat App: WebSocket chat service in Go handling 50k concurrent connections.

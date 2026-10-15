@@ -1,0 +1,59 @@
+name: Daily Job Search Agent
+
+on:
+  schedule:
+    # 00:00 UTC daily (08:00 UTC+8)
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      roles:
+        description: "Comma-separated target roles (overrides default)"
+        required: false
+        default: ""
+      locations:
+        description: "Comma-separated target locations (overrides default)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-job-agent
+  cancel-in-progress: false
+
+jobs:
+  run-agent:
+    name: Scan job boards and email digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+      EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+      EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+      TARGET_ROLES: ${{ inputs.roles || vars.TARGET_ROLES || 'Backend Engineer, Machine Learning Engineer, Full Stack Developer' }}
+      TARGET_LOCATIONS: ${{ inputs.locations || vars.TARGET_LOCATIONS || 'Singapore, Remote (APAC)' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Sanity-check project modules
+        run: python -c "import main; from src import config, state, nodes, email_service, graph; print('modules OK')"
+
+      - name: Run job-search agent
+        run: python main.py
