@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Callable
@@ -136,7 +137,7 @@ def _llm(settings: Settings, model_id: str | None = None) -> ChatGoogleGenerativ
         temperature=MODEL_TEMPERATURE,
         api_key=settings.gemini_api_key,
         timeout=60,
-        max_retries=2,
+        max_retries=0,
     )
 
 
@@ -155,6 +156,31 @@ def _is_model_not_found(exc: Exception) -> bool:
     return "404" in text or "NOT_FOUND" in text or "is not found" in text.lower()
 
 
+_RETRY_AFTER_RE = re.compile(r"retry(?:Delay)?[:\s]+(\d+(?:\.\d+)?)\s*s?", re.IGNORECASE)
+_MAX_RATE_LIMIT_SLEEP = 45.0
+
+
+def _rate_limit_delay(exc: Exception) -> float | None:
+    """Seconds to wait for a 429/503, or None if the error is not rate limiting.
+
+    Gemini's free tier caps generate_content at ~5 requests/minute, which the
+    batch-then-per-job matcher can exceed. Honoring the server's retryDelay lets
+    the run finish instead of scoring nothing.
+    """
+    text = str(exc)
+    if not ("429" in text or "RESOURCE_EXHAUSTED" in text or "503" in text or "UNAVAILABLE" in text):
+        return None
+    match = _RETRY_AFTER_RE.search(text)
+    if match:
+        return min(float(match.group(1)) + 1.0, _MAX_RATE_LIMIT_SLEEP)
+    return 10.0
+
+
+def _is_retryable(exc: Exception) -> bool:
+    text = str(exc)
+    return _rate_limit_delay(exc) is not None or "timeout" in text.lower()
+
+
 def _candidate_models(settings: Settings) -> list[str]:
     candidates: list[str] = []
     for model_id in (_active_model, settings.gemini_model, *_MODEL_FALLBACKS):
@@ -169,18 +195,31 @@ def _generate(settings: Settings, messages: list) -> Any:
 
     last_error: Exception | None = None
     for model_id in _candidate_models(settings):
-        try:
-            response = _llm(settings, model_id).invoke(messages)
-        except Exception as exc:  # noqa: BLE001 - decide fallback by error text
-            if not _is_model_not_found(exc):
-                raise
-            logger.warning("Gemini model %s unavailable, trying next: %s", model_id, exc)
-            last_error = exc
-            continue
-        if model_id != _active_model:
-            logger.info("Using Gemini model %s", model_id)
-        _active_model = model_id
-        return response
+        for attempt in range(3):
+            try:
+                response = _llm(settings, model_id).invoke(messages)
+            except Exception as exc:  # noqa: BLE001 - decide fallback by error text
+                if not _is_model_not_found(exc):
+                    delay = _rate_limit_delay(exc)
+                    if delay is None or attempt == 2:
+                        raise
+                    logger.warning(
+                        "Gemini rate limited (%s); waiting %.0fs (attempt %d/3)",
+                        model_id,
+                        delay,
+                        attempt + 1,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.warning("Gemini model %s unavailable, trying next: %s", model_id, exc)
+                last_error = exc
+                break
+            else:
+                if model_id != _active_model:
+                    logger.info("Using Gemini model %s", model_id)
+                _active_model = model_id
+                return response
+        continue
 
     raise last_error or RuntimeError("no usable Gemini model found")
 
@@ -209,10 +248,21 @@ def _source_from_url(url: str) -> str:
 _JUNK_TITLE_RE = re.compile(
     r"^(page_?title|jobs?|careers?|home|search( for jobs?)?|job( |_)application|"
     r"open positions|opportunities|vacanc(y|ies))\b"
-    r"|\b(search for jobs|careers -|career site|job board)s?\b"
+    r"|\b(search for jobs|careers -|career site|job board|jobs in [A-Z])s?\b"
     r"|^jobs at\b",
     re.IGNORECASE,
 )
+
+# JobStreet (and similar aggregators) expose category landing pages at URLs that look
+# like postings -- "/jobs-in-Kuala-Lumpur", "/all-jobs" -- but only contain listings,
+# not requirements. Real JobStreet postings live under a /job/segment with a numeric id.
+_LISTING_PATH_RE = re.compile(
+    r"/(jobs?|careers?|vacanc(?:y|ies))(-in-[a-z0-9-]+)?$"
+    r"|/(all|search|latest|browse|category|categories)[-_]?"
+    r"(jobs?|roles?|positions?|openings?)",
+    re.IGNORECASE,
+)
+_NUMERIC_ID_RE = re.compile(r"/(\d{5,})(?:[/?#]|$)")
 
 
 def _looks_like_posting(url: str, title: str, snippet: str) -> bool:
@@ -221,12 +271,17 @@ def _looks_like_posting(url: str, title: str, snippet: str) -> bool:
     if not cleaned or _JUNK_TITLE_RE.search(cleaned):
         return False
     try:
-        segments = [seg for seg in urlparse(url).path.split("/") if seg]
+        parsed = urlparse(url)
+        segments = [seg for seg in parsed.path.split("/") if seg]
     except ValueError:
         return False
     # Real postings sit at least two path levels deep (/jobs/123, /job/title-slug);
     # index pages are the domain root or a single locale/marketing segment.
     if len(segments) < 2:
+        return False
+    # A category/listing shell ("Backend Jobs in Kuala Lumpur") is not a posting even
+    # when its URL has two segments. Only let it through if the URL carries a posting id.
+    if _LISTING_PATH_RE.search(parsed.path) and not _NUMERIC_ID_RE.search(parsed.path):
         return False
     return len(snippet) >= 30
 
@@ -334,13 +389,15 @@ def planner(
                 "Return ONLY a JSON array of exactly 3 search strings, each tailored "
                 "to a different slice of the candidate's background. Rules:\n"
                 "1. Each query must combine a specific technical job title with a location.\n"
-                "2. Spread the queries across job boards using operators such as "
-                "{boards} plus regional boards (JobStreet, LinkedIn Jobs) where relevant.\n"
+                "2. At most ONE of the 3 queries may target a regional aggregator "
+                "(JobStreet, LinkedIn). Aggregators often expose only category listing "
+                "pages, which carry no requirements to score, so favour boards that "
+                "publish full posting text: {boards}.\n"
                 "3. Prefer quoted phrases and recent-active-posting phrasing, e.g. "
-                '"Senior Python Engineer" "Singapore" site:greenhouse.io hiring 2026.\n'
-                "4. Reserve one query for a regional board using its exact site: operator, "
-                "e.g. site:my.jobstreet.com or site:jobstreet.com.my for Malaysia, or "
-                "site:linkedin.com/jobs.\n"
+                '"Senior Python Engineer" "Kuala Lumpur" site:lever.co hiring 2026.\n'
+                "4. When a regional board query is used, aim it at a single role title so "
+                "the results are postings rather than category pages, e.g. "
+                '"Backend Engineer" "Kuala Lumpur" site:my.jobstreet.com.\n'
                 "5. Never include 'remote worldwide' or 'work from anywhere' phrasing unless "
                 "the target locations explicitly say Remote.\n"
                 "6. No commentary, no markdown fences - raw JSON array only."
