@@ -124,6 +124,7 @@ def run(args: argparse.Namespace) -> int:
     graph = build_graph(settings)
     current: dict[str, Any] = dict(state)
     total = len(NODE_ORDER)
+    previous_error: str | None = None
 
     for step, chunk in enumerate(graph.stream(state, stream_mode="updates"), start=1):
         for node, update in chunk.items():
@@ -131,7 +132,11 @@ def run(args: argparse.Namespace) -> int:
                 continue
             current.update(update or {})
             index = NODE_ORDER.index(node) + 1 if node in NODE_ORDER else step
-            marker = "OK  " if not update.get("error") else "FAIL"
+            # Only flag FAIL when this node introduced the error, not when it
+            # merely inherited an earlier node's error in the shared state.
+            node_error = (update or {}).get("error")
+            marker = "FAIL" if node_error and node_error != previous_error else "OK  "
+            previous_error = node_error or previous_error
             _print(f"[{index}/{total}] {marker} {node:<9} {_describe(node, update)}")
 
     _print("-" * 70)

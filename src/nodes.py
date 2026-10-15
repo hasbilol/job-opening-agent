@@ -97,14 +97,59 @@ def _extract_json(text: str) -> Any:
     return value
 
 
-def _llm(settings: Settings) -> ChatGoogleGenerativeAI:
+def _llm(settings: Settings, model_id: str | None = None) -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
-        model=settings.gemini_model,
+        model=model_id or settings.gemini_model,
         temperature=MODEL_TEMPERATURE,
         api_key=settings.gemini_api_key,
         timeout=60,
         max_retries=2,
     )
+
+
+# Google retires Gemini models periodically (e.g. gemini-1.5-flash 404s, gemini-2.0-flash
+# shut down June 2026), so try the configured model first, then current flash models.
+_MODEL_FALLBACKS = (
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+)
+_active_model: str | None = None
+
+
+def _is_model_not_found(exc: Exception) -> bool:
+    text = str(exc)
+    return "404" in text or "NOT_FOUND" in text or "is not found" in text.lower()
+
+
+def _candidate_models(settings: Settings) -> list[str]:
+    candidates: list[str] = []
+    for model_id in (_active_model, settings.gemini_model, *_MODEL_FALLBACKS):
+        if model_id and model_id not in candidates:
+            candidates.append(model_id)
+    return candidates
+
+
+def _generate(settings: Settings, messages: list) -> Any:
+    """Invoke Gemini, falling through the model chain on NOT_FOUND errors."""
+    global _active_model
+
+    last_error: Exception | None = None
+    for model_id in _candidate_models(settings):
+        try:
+            response = _llm(settings, model_id).invoke(messages)
+        except Exception as exc:  # noqa: BLE001 - decide fallback by error text
+            if not _is_model_not_found(exc):
+                raise
+            logger.warning("Gemini model %s unavailable, trying next: %s", model_id, exc)
+            last_error = exc
+            continue
+        if model_id != _active_model:
+            logger.info("Using Gemini model %s", model_id)
+        _active_model = model_id
+        return response
+
+    raise last_error or RuntimeError("no usable Gemini model found")
 
 
 def _fallback_queries(target_roles: str, target_locations: str) -> list[str]:
@@ -191,7 +236,7 @@ def planner(
     ]
 
     try:
-        response = _message_text(_llm(cfg).invoke(prompt))
+        response = _message_text(_generate(cfg, prompt))
         queries = _extract_json(response)
         if not isinstance(queries, list):
             raise ValueError("model did not return a list")
@@ -342,11 +387,12 @@ def matcher(
     cfg = _resolve(settings)
     jobs: list[dict] = state["raw_jobs"]
     expected_ids = set(range(len(jobs)))
-    model = _llm(cfg)
 
     scores: dict[int, JobMatchScore] = {}
     try:
-        response = _message_text(model.invoke(_scoring_messages(state.get("resume_text", ""), jobs)))
+        response = _message_text(
+            _generate(cfg, _scoring_messages(state.get("resume_text", ""), jobs))
+        )
         scores = _parse_scores(response, expected_ids)
         if len(scores) < len(jobs):
             raise ValueError(f"batch scored {len(scores)}/{len(jobs)} jobs")
@@ -359,7 +405,7 @@ def matcher(
             continue
         try:
             response = _message_text(
-                model.invoke(_scoring_messages(state.get("resume_text", ""), [job]))
+                _generate(cfg, _scoring_messages(state.get("resume_text", ""), [job]))
             )
             individual = _parse_scores(response, {index})
             if index in individual:

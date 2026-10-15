@@ -49,7 +49,7 @@ class Settings:
     email_app_password: str
     email_recipient: str
 
-    gemini_model: str = "gemini-1.5-flash"
+    gemini_model: str = "gemini-3.8-flash"
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 465
 
@@ -85,7 +85,7 @@ def load_settings(*, strict: bool = True) -> Settings:
         email_sender=values["EMAIL_SENDER"],
         email_app_password=values["EMAIL_APP_PASSWORD"],
         email_recipient=values["EMAIL_RECIPIENT"],
-        gemini_model=_get("GEMINI_MODEL", "gemini-1.5-flash"),
+        gemini_model=_get("GEMINI_MODEL", "gemini-3.8-flash"),
         smtp_host=_get("SMTP_HOST", "smtp.gmail.com"),
         smtp_port=_get_int("SMTP_PORT", 465),
         target_roles=_get("TARGET_ROLES", "Backend Engineer, Machine Learning Engineer"),
