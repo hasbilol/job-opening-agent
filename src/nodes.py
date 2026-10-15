@@ -171,6 +171,38 @@ def _source_from_url(url: str) -> str:
         return "unknown"
 
 
+# Career-site index pages and placeholder titles pollute results (e.g. a page whose
+# <title> is literally "page_title", or a "/en" careers landing page).
+_JUNK_TITLE_RE = re.compile(
+    r"^(page_?title|jobs?|careers?|home|search( for jobs?)?|job( |_)application|"
+    r"open positions|opportunities|vacanc(y|ies))\b"
+    r"|\b(search for jobs|careers -|career site|job board)s?\b"
+    r"|^jobs at\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_posting(url: str, title: str, snippet: str) -> bool:
+    """Heuristic filter for real job postings vs. career-site index pages."""
+    cleaned = re.sub(r"\s+", " ", title).strip()
+    if not cleaned or _JUNK_TITLE_RE.search(cleaned):
+        return False
+    try:
+        segments = [seg for seg in urlparse(url).path.split("/") if seg]
+    except ValueError:
+        return False
+    # Real postings sit at least two path levels deep (/jobs/123, /job/title-slug);
+    # index pages are the domain root or a single locale/marketing segment.
+    if len(segments) < 2:
+        return False
+    return len(snippet) >= 30
+
+
+def _title_key(title: str) -> str:
+    """Normalize a title so near-duplicates collapse (spacing, case, punctuation)."""
+    return re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+
+
 # --------------------------------------------------------------------------- #
 # Structured scoring schema
 # --------------------------------------------------------------------------- #
@@ -275,6 +307,8 @@ def searcher(
     max_results = cfg.max_results_per_query
 
     seen: dict[str, dict] = {}
+    seen_titles: set[str] = set()
+    skipped = 0
     failures = 0
     for query in state["queries"]:
         try:
@@ -293,11 +327,21 @@ def searcher(
             url = (result.get("url") or "").strip()
             if not url or url in seen:
                 continue
+            title = (result.get("title") or "").strip() or "Untitled role"
             snippet = (
                 result.get("content") or result.get("raw_content") or ""
             ).strip()
+            if not _looks_like_posting(url, title, snippet):
+                skipped += 1
+                logger.debug("Skipping non-posting result %r (%s)", title, url)
+                continue
+            title_key = _title_key(title)
+            if title_key in seen_titles:
+                skipped += 1
+                continue
+            seen_titles.add(title_key)
             seen[url] = {
-                "title": (result.get("title") or "Untitled role").strip(),
+                "title": title,
                 "url": url,
                 "snippet": snippet[:_SNIPPET_LIMIT],
                 "source": _source_from_url(url),
@@ -307,7 +351,11 @@ def searcher(
     if failures and failures == len(state["queries"]):
         state["error"] = f"searcher: all {failures} Tavily queries failed"
         logger.error("%s", state["error"])
-    logger.info("Searcher collected %d unique postings", len(state["raw_jobs"]))
+    logger.info(
+        "Searcher collected %d unique postings (%d results skipped as index pages or duplicates)",
+        len(state["raw_jobs"]),
+        skipped,
+    )
     return state
 
 
