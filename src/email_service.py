@@ -7,6 +7,7 @@ import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from urllib.parse import urlparse
 
 from .config import Settings
 
@@ -71,6 +72,26 @@ def render_matches_email(matches: list[dict], *, date_label: str, roles: str) ->
             else f'<span style="color:#111827;font-weight:600;">{title}</span>'
         )
 
+        link_cell = ""
+        if url:
+            try:
+                domain = urlparse(url).netloc.replace("www.", "")
+            except ValueError:
+                domain = ""
+            link_cell = (
+                '<div style="margin-top:10px;">'
+                f'<a href="{url}" style="display:inline-block;background:#4f46e5;'
+                'color:#ffffff;font-size:13px;font-weight:600;padding:8px 16px;'
+                'border-radius:8px;text-decoration:none;">View posting &rarr;</a>'
+                + (
+                    f'<span style="margin-left:10px;font-size:12px;color:#9ca3af;">'
+                    f"via {_esc(domain)}</span>"
+                    if domain
+                    else ""
+                )
+                + "</div>"
+            )
+
         rows.append(
             "<tr>"
             f'<td style="padding:16px;border-bottom:1px solid #e5e7eb;vertical-align:top;width:90px;">'
@@ -78,6 +99,7 @@ def render_matches_email(matches: list[dict], *, date_label: str, roles: str) ->
             '<td style="padding:16px;border-bottom:1px solid #e5e7eb;vertical-align:top;">'
             f"{title_cell}"
             f'<div style="margin-top:6px;font-size:14px;color:#4b5563;line-height:1.5;">{rationale}</div>'
+            f"{link_cell}"
             '<div style="margin-top:10px;"><span style="font-size:11px;font-weight:700;'
             'color:#16a34a;letter-spacing:0.5px;">MATCHED</span><br>'
             f"{_skill_list(list(matched))}</div>"

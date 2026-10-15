@@ -2,6 +2,12 @@
 .env.*
 !.env.example
 
+# Real resumes stay local - the production copy lives in GitHub Actions secrets
+resume.local.txt
+resume.real.txt
+resume.private.txt
+resume*.local
+
 __pycache__/
 *.py[cod]
 *$py.class

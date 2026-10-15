@@ -8,8 +8,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,8 +33,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         type=Path,
-        default=DEFAULT_RESUME,
-        help="Path to the resume/profile text file (default: resume.txt)",
+        default=None,
+        help=(
+            "Path to a resume text file. Overrides the RESUME_B64/RESUME_TEXT "
+            "environment secrets. Default: RESUME_B64 > RESUME_TEXT > resume.txt"
+        ),
     )
     parser.add_argument(
         "--roles",
@@ -62,11 +67,33 @@ def _print(message: str) -> None:
     print(message, flush=True)
 
 
-def _read_resume(path: Path) -> str:
-    if not path.exists():
-        logger.warning("Resume file %s not found; continuing without it", path)
-        return ""
-    return path.read_text(encoding="utf-8").strip()
+def _read_resume(path: Path, *, allow_env: bool = True) -> tuple[str, str]:
+    """Load the resume, preferring private env secrets over the repo file.
+
+    Priority: ``RESUME_B64`` > ``RESUME_TEXT`` > ``path`` (returns text and a
+    human-readable source label). The repo's resume.txt stays a non-sensitive
+    template; a real resume is supplied via GitHub Actions secrets so it never
+    lands in git history.
+    """
+    if allow_env:
+        encoded = os.getenv("RESUME_B64", "").strip()
+        if encoded:
+            try:
+                text = base64.b64decode(encoded).decode("utf-8").strip()
+            except Exception as exc:
+                logger.warning("RESUME_B64 could not be decoded (%s); ignoring it", exc)
+            else:
+                if text:
+                    return text, "RESUME_B64 secret"
+        text = os.getenv("RESUME_TEXT", "").strip()
+        if text:
+            return text, "RESUME_TEXT secret"
+
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip(), str(path)
+
+    logger.warning("Resume file %s not found; continuing without it", path)
+    return "", str(path)
 
 
 def _describe(node: str, update: dict[str, Any]) -> str:
@@ -98,7 +125,10 @@ def run(args: argparse.Namespace) -> int:
         _print(f"[config] {exc}")
         return 2
 
-    resume_text = _read_resume(args.resume)
+    resume_path = args.resume or DEFAULT_RESUME
+    resume_text, resume_source = _read_resume(
+        resume_path, allow_env=args.resume is None
+    )
     roles = args.roles or settings.target_roles
     locations = args.locations or settings.target_locations
 
@@ -115,7 +145,7 @@ def run(args: argparse.Namespace) -> int:
     _print("=" * 70)
     _print("  DAILY JOB SEARCH AGENT")
     _print("=" * 70)
-    _print(f"  resume    : {args.resume} ({len(resume_text)} chars)")
+    _print(f"  resume    : {resume_source} ({len(resume_text)} chars)")
     _print(f"  roles     : {roles}")
     _print(f"  locations : {locations}")
     _print(f"  model     : {settings.gemini_model} | threshold: {settings.match_threshold}%")

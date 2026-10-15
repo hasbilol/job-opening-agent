@@ -34,6 +34,10 @@ jobs:
       EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
       EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
       EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+      # Private resume: set RESUME_TEXT (paste) or RESUME_B64 (base64) as a
+      # repository secret. Falls back to the placeholder resume.txt otherwise.
+      RESUME_TEXT: ${{ secrets.RESUME_TEXT }}
+      RESUME_B64: ${{ secrets.RESUME_B64 }}
       TARGET_ROLES: ${{ inputs.roles || vars.TARGET_ROLES || 'Backend Engineer, Machine Learning Engineer, Full Stack Developer' }}
       TARGET_LOCATIONS: ${{ inputs.locations || vars.TARGET_LOCATIONS || 'Singapore, Remote (APAC)' }}
 
