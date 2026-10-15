@@ -25,13 +25,19 @@ logger = logging.getLogger(__name__)
 MODEL_TEMPERATURE = 0.2
 _SNIPPET_LIMIT = 900
 _RESUME_LIMIT = 6000
+_QUERY_COUNT = 5
+# Ordered by how well each board carries postings for a specific country. JobStreet
+# dominates Malaysia/Singapore and the Gulf; Greenhouse/Lever/Workday are US/EU-heavy
+# and mostly waste queries when the target locations are a single non-US country.
+# The planner is told to treat this as priority order, so the country-local boards
+# come first.
 _JOB_BOARD_SITES = (
-    "site:greenhouse.io",
-    "site:lever.co",
-    "site:myworkdayjobs.com",
     "site:my.jobstreet.com",
     "site:jobstreet.com.my",
     "site:linkedin.com/jobs",
+    "site:myworkdayjobs.com",
+    "site:lever.co",
+    "site:greenhouse.io",
 )
 
 # Geographic expansions so "Kuala Lumpur" also accepts jobs posted in the wider
@@ -229,10 +235,16 @@ def _fallback_queries(target_roles: str, target_locations: str) -> list[str]:
     roles = [r.strip() for r in target_roles.split(",") if r.strip()] or [
         "Software Engineer"
     ]
-    location = target_locations.strip() or "Remote"
+    # Split on ';' so a multi-target string ("KL, Malaysia; Penang, Malaysia") becomes
+    # one query per location -- quoting the whole raw string matches nothing. Commas
+    # stay inside a location name ("Kuala Lumpur, Malaysia").
+    locations = [loc.strip() for loc in target_locations.split(";") if loc.strip()] or [
+        "Remote"
+    ]
     return [
-        f'"{roles[i % len(roles)]}" jobs "{location}" {_JOB_BOARD_SITES[i % len(_JOB_BOARD_SITES)]}'
-        for i in range(3)
+        f'"{roles[i % len(roles)]}" "{locations[i % len(locations)]}" '
+        f"{_JOB_BOARD_SITES[i % len(_JOB_BOARD_SITES)]}"
+        for i in range(_QUERY_COUNT)
     ]
 
 
@@ -269,17 +281,35 @@ _AGGREGATOR_HOST_RE = re.compile(
     r"(?:^|\.)jobstreet\.|linkedin\.com$|indeed\.|glassdoor\.",
     re.IGNORECASE,
 )
+# A URL that unambiguously points at one posting. On job-board hosts the path segment
+# names are fixed ("jobs/<id>", "job/<slug>-<id>", "<company>/jobs/<id>"), so a match
+# here is a posting regardless of what the page's boilerplate <title> says -- Greenhouse
+# titles every posting "Job Application for <Role>", and that title must not veto the URL.
+_EXPLICIT_POSTING_RE = re.compile(
+    r"job-boards(?:\.[a-z]{2,6})?\.greenhouse\.io/[^/]+/jobs/\d+"
+    r"|jobs\.greenhouse\.io/[^/]+/jobs/\d+"
+    r"|jobs\.lever\.co/[^/]+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"|/job/[a-z0-9-]+-\d{4,}"
+    r"|/jobs/view/\d+"
+    r"|myworkdayjobs\.com/[^/]+/job/[^/]+",
+    re.IGNORECASE,
+)
 
 
 def _looks_like_posting(url: str, title: str, snippet: str) -> bool:
     """Heuristic filter for real job postings vs. career-site index pages."""
     cleaned = re.sub(r"\s+", " ", title).strip()
-    if not cleaned or _JUNK_TITLE_RE.search(cleaned):
-        return False
     try:
         parsed = urlparse(url)
         segments = [seg for seg in parsed.path.split("/") if seg]
     except ValueError:
+        return False
+    # A URL that names one posting beats any boilerplate <title>. Greenhouse titles
+    # every posting "Job Application for <Role>" and many boards title a posting
+    # "Jobs at <Company>", which the junk-title check would otherwise reject.
+    if _EXPLICIT_POSTING_RE.search(url):
+        return len(snippet) >= 30
+    if not cleaned or _JUNK_TITLE_RE.search(cleaned):
         return False
     # Real postings sit at least two path levels deep (/jobs/123, /job/title-slug);
     # index pages are the domain root or a single locale/marketing segment.
@@ -395,18 +425,24 @@ def planner(
                 "Target roles: {roles}\n"
                 "Target locations: {locations}\n\n"
                 "Candidate resume:\n{resume}\n\n"
-                "Return ONLY a JSON array of exactly 3 search strings, each tailored "
-                "to a different slice of the candidate's background. Rules:\n"
-                "1. Each query must combine a specific technical job title with a location.\n"
-                "2. At most ONE of the 3 queries may target a regional aggregator "
-                "(JobStreet, LinkedIn). Aggregators often expose only category listing "
-                "pages, which carry no requirements to score, so favour boards that "
-                "publish full posting text: {boards}.\n"
-                "3. Prefer quoted phrases and recent-active-posting phrasing, e.g. "
-                '"Senior Python Engineer" "Kuala Lumpur" site:lever.co hiring 2026.\n'
-                "4. When a regional board query is used, aim it at a single role title so "
-                "the results are postings rather than category pages, e.g. "
-                '"Backend Engineer" "Kuala Lumpur" site:my.jobstreet.com.\n'
+                "Return ONLY a JSON array of exactly {count} search strings, each tailored "
+                "to a different slice of the candidate's background.\n\n"
+                "The search MUST target the target locations above. A query that could "
+                "return a posting anywhere in the world is wasted, because results "
+                "outside the target locations are discarded before scoring. Repeat the "
+                "target location as a quoted phrase in EVERY query.\n\n"
+                "Boards to use, in priority order: {boards}. The first boards listed are "
+                "job boards that carry postings in the target locations; later entries are "
+                "global boards that mostly return postings in other countries, so use those "
+                "only if the target locations are themselves global (for example 'Remote').\n\n"
+                "Rules:\n"
+                "1. Every query combines one specific technical job title with the target "
+                'location, e.g. "Senior Python Engineer" "Kuala Lumpur".\n'
+                "2. Pin each query to one board with a site: operator. Cover as many of the "
+                "location-appropriate boards as the query count allows.\n"
+                "3. Aim at a single role title, never a category, so results are postings "
+                "rather than listing pages.\n"
+                "4. Use recent-active phrasing such as 'hiring 2026'.\n"
                 "5. Never include 'remote worldwide' or 'work from anywhere' phrasing unless "
                 "the target locations explicitly say Remote.\n"
                 "6. No commentary, no markdown fences - raw JSON array only."
@@ -415,6 +451,7 @@ def planner(
                 locations=locations,
                 resume=resume[:_RESUME_LIMIT] or "(not provided)",
                 boards=", ".join(_JOB_BOARD_SITES),
+                count=_QUERY_COUNT,
             )
         ),
     ]
@@ -424,22 +461,22 @@ def planner(
         queries = _extract_json(response)
         if not isinstance(queries, list):
             raise ValueError("model did not return a list")
-        queries = [str(q).strip() for q in queries if str(q).strip()][:3]
+        queries = [str(q).strip() for q in queries if str(q).strip()][:_QUERY_COUNT]
     except Exception as exc:
         logger.warning("Planner fell back to deterministic queries: %s", exc)
         queries = []
 
-    if len(queries) < 3:
+    if len(queries) < _QUERY_COUNT:
         for fallback in _fallback_queries(roles, locations):
             if fallback not in queries:
                 queries.append(fallback)
-            if len(queries) == 3:
+            if len(queries) == _QUERY_COUNT:
                 break
 
     logger.info("Planner produced %d queries", len(queries))
-    for query in queries[:3]:
+    for query in queries[:_QUERY_COUNT]:
         logger.info("  query: %s", query)
-    state["queries"] = queries[:3]
+    state["queries"] = queries[:_QUERY_COUNT]
     return state
 
 
@@ -458,7 +495,10 @@ def searcher(
 
     cfg = _resolve(settings)
     client = TavilyClient(api_key=cfg.tavily_api_key)
-    max_results = cfg.max_results_per_query
+    # Total Tavily results stay bounded regardless of query count, while each query
+    # still pulls enough rows that a real posting survives the category-page cull on
+    # a narrow board (one JobStreet country site returns mostly category pages).
+    max_results = max(5, cfg.max_results_per_query, 30 // max(1, len(state["queries"])))
 
     locations = state.get("target_locations") or cfg.target_locations
     signals = _location_signals(locations)
