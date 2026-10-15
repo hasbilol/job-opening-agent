@@ -495,7 +495,7 @@ def searcher(
             ).strip()
             if not _looks_like_posting(url, title, snippet):
                 skipped["not_a_posting"] += 1
-                logger.debug("Skipping non-posting result %r (%s)", title, url)
+                logger.info("Skipping non-posting result %r (%s)", title, url)
                 continue
             if signals:
                 haystack = f"{title} {snippet} {url}".lower()
@@ -503,7 +503,7 @@ def searcher(
                 remote_match = remote_ok and bool(re.search(r"\bremote\b", haystack))
                 if not located and not remote_match:
                     skipped["out_of_area"] += 1
-                    logger.debug("Skipping out-of-area result %r (%s)", title, url)
+                    logger.info("Skipping out-of-area result %r (%s)", title, url)
                     continue
             title_key = _title_key(title)
             if title_key in seen_titles:
