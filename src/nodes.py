@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -155,6 +157,24 @@ _MODEL_FALLBACKS = (
     "gemini-2.5-flash",
 )
 _active_model: str | None = None
+# The free tier also caps generate_content at 20 requests/DAY per model
+# (GenerateRequestsPerDayPerProjectPerModel-FreeTier). That cap is per model, so a
+# model that reports a hours-long retryDelay is dead for the day and the chain must
+# move on instead of sleeping; models known-dead this run are skipped outright.
+_quota_exhausted_models: set[str] = set()
+# Hard per-run budget so the matcher's per-job fallback cannot burn the daily quota
+# on a single run (one request per job adds up fast).
+_DAILY_REQUEST_BUDGET = max(1, int(os.getenv("GEMINI_REQUEST_BUDGET", "16")))
+_requests_used = 0
+
+
+def _acquire_request_slot() -> None:
+    global _requests_used
+    if _requests_used >= _DAILY_REQUEST_BUDGET:
+        raise RuntimeError(
+            f"Gemini request budget exhausted for this run ({_requests_used}/{_DAILY_REQUEST_BUDGET})"
+        )
+    _requests_used += 1
 
 
 def _is_model_not_found(exc: Exception) -> bool:
@@ -187,17 +207,45 @@ def _is_retryable(exc: Exception) -> bool:
     return _rate_limit_delay(exc) is not None or "timeout" in text.lower()
 
 
+_RETRY_HOURS_RE = re.compile(r"retry in (\d+)h", re.IGNORECASE)
+# A retryDelay beyond this is not "back off a few seconds" -- it is the daily
+# quota saying come back tomorrow (observed: retryDelay: 47777s on free tier).
+_DAILY_QUOTA_MIN_DELAY = 300.0
+
+
+def _is_daily_quota(exc: Exception) -> bool:
+    """True when a 429 means the per-model daily quota, not a burst limit."""
+    text = str(exc)
+    if "429" not in text and "RESOURCE_EXHAUSTED" not in text:
+        return False
+    hours = _RETRY_HOURS_RE.search(text)
+    if hours and int(hours.group(1)) >= 1:
+        return True
+    match = _RETRY_AFTER_RE.search(text)
+    return bool(match and float(match.group(1)) > _DAILY_QUOTA_MIN_DELAY)
+
+
+def _is_quota_exhausted(exc: Exception) -> bool:
+    """Daily quota gone for every model, or our own per-run budget spent."""
+    text = str(exc).lower()
+    return _is_daily_quota(exc) or "budget exhausted" in text or "no usable gemini" in text
+
+
 def _candidate_models(settings: Settings) -> list[str]:
     candidates: list[str] = []
     for model_id in (_active_model, settings.gemini_model, *_MODEL_FALLBACKS):
-        if model_id and model_id not in candidates:
+        if model_id and model_id not in candidates and model_id not in _quota_exhausted_models:
             candidates.append(model_id)
     return candidates
 
 
 def _generate(settings: Settings, messages: list) -> Any:
-    """Invoke Gemini, falling through the model chain on NOT_FOUND errors."""
+    """Invoke Gemini, falling through the model chain on NOT_FOUND or daily quota."""
     global _active_model
+
+    _acquire_request_slot()
+    if not _candidate_models(settings):
+        raise RuntimeError("all Gemini models have exhausted their daily quota")
 
     last_error: Exception | None = None
     for model_id in _candidate_models(settings):
@@ -205,21 +253,34 @@ def _generate(settings: Settings, messages: list) -> Any:
             try:
                 response = _llm(settings, model_id).invoke(messages)
             except Exception as exc:  # noqa: BLE001 - decide fallback by error text
-                if not _is_model_not_found(exc):
-                    delay = _rate_limit_delay(exc)
-                    if delay is None or attempt == 2:
-                        raise
+                if _is_model_not_found(exc):
                     logger.warning(
-                        "Gemini rate limited (%s); waiting %.0fs (attempt %d/3)",
-                        model_id,
-                        delay,
-                        attempt + 1,
+                        "Gemini model %s unavailable, trying next: %s", model_id, exc
                     )
-                    time.sleep(delay)
-                    continue
-                logger.warning("Gemini model %s unavailable, trying next: %s", model_id, exc)
-                last_error = exc
-                break
+                    last_error = exc
+                    break
+                if _is_daily_quota(exc):
+                    # Sleep-and-retry cannot help within this run; the cap is per model,
+                    # so move to the next model in the chain instead of waiting hours.
+                    _quota_exhausted_models.add(model_id)
+                    logger.warning(
+                        "Gemini daily quota exhausted for %s, trying next model: %s",
+                        model_id,
+                        exc,
+                    )
+                    last_error = exc
+                    break
+                delay = _rate_limit_delay(exc)
+                if delay is None or attempt == 2:
+                    raise
+                logger.warning(
+                    "Gemini rate limited (%s); waiting %.0fs (attempt %d/3)",
+                    model_id,
+                    delay,
+                    attempt + 1,
+                )
+                time.sleep(delay)
+                continue
             else:
                 if model_id != _active_model:
                     logger.info("Using Gemini model %s", model_id)
@@ -639,6 +700,60 @@ def _parse_scores(raw: str, expected_ids: set[int]) -> dict[int, JobMatchScore]:
     return parsed
 
 
+# --------------------------------------------------------------------------- #
+# Keyword-heuristic scorer -- last-resort scoring when Gemini is unavailable
+# (daily quota spent, all models 429). Keeps the digest flowing with direct
+# posting URLs instead of failing the run.
+# --------------------------------------------------------------------------- #
+_STOPWORDS = frozenset(
+    """
+    the and for you our with are will this that have from your who what when where
+    about must can all not but they their them been more than then also work working
+    role team skills experience years job position company ability strong well other
+    some any per via within including etc may should would required requirements
+    candidate ideal apply benefits benefit salary please join looking ideal youll
+    across using use used help make many like new one two well get set key
+    """
+)
+
+
+def _keyword_tokens(text: str) -> set[str]:
+    words = re.findall(r"[a-z][a-z0-9+#]{2,}", (text or "").lower())
+    return {w for w in words if w not in _STOPWORDS}
+
+
+def _heuristic_score(job: dict, resume_text: str) -> JobMatchScore:
+    """Score by keyword overlap between the resume and the posting text.
+
+    Calibrated so strong overlaps land in the high scores and generic-word-only
+    overlap stays far below the match threshold. job_location stays empty: the
+    searcher already filtered postings by location, and the matcher's location
+    pass is skipped when it is empty.
+    """
+    resume_kw = _keyword_tokens(resume_text)
+    job_kw = _keyword_tokens(f"{job.get('title', '')} {job.get('snippet', '')}")
+    matched = sorted(resume_kw & job_kw)
+    if resume_kw and job_kw:
+        ratio = len(matched) / math.sqrt(len(resume_kw) * len(job_kw))
+        score = round(min(95.0, ratio * 380.0))
+    else:
+        score = 0
+    return JobMatchScore(
+        match_score=score,
+        rationale=(
+            "Keyword heuristic (Gemini unavailable): "
+            f"{len(matched)} resume keywords appear in this posting, "
+            "so the score is overlap-based rather than a full fit analysis."
+        ),
+        matched_skills=matched[:10],
+        missing_or_gap_skills=[],
+        job_location="",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Node 3: matcher / scorer (continues)
+# --------------------------------------------------------------------------- #
 @_safe_node("matcher")
 def matcher(
     state: JobHunterState,
@@ -667,12 +782,19 @@ def matcher(
         if len(scores) < len(jobs):
             raise ValueError(f"batch scored {len(scores)}/{len(jobs)} jobs")
     except Exception as exc:
-        logger.warning("Batch scoring unavailable (%s); retrying per job", exc)
-        scores = {}
+        if _is_quota_exhausted(exc):
+            logger.warning("Batch scoring skipped, Gemini quota exhausted: %s", exc)
+            scores = {}
+        else:
+            logger.warning("Batch scoring unavailable (%s); retrying per job", exc)
+            scores = {}
 
+    stop_per_job = False
     for index, job in enumerate(jobs):
         if index in scores:
             continue
+        if stop_per_job:
+            break
         try:
             response = _message_text(
                 _generate(
@@ -687,6 +809,22 @@ def matcher(
                 logger.warning("No score returned for %r", job.get("title"))
         except Exception as exc:
             logger.warning("Scoring failed for %r: %s", job.get("title"), exc)
+            if _is_quota_exhausted(exc):
+                # More calls would 429 for the rest of the day; fall through to
+                # the heuristic scorer for the remaining postings.
+                stop_per_job = True
+
+    heuristic_count = 0
+    if len(scores) < len(jobs):
+        for index, job in enumerate(jobs):
+            if index not in scores:
+                scores[index] = _heuristic_score(job, state.get("resume_text", ""))
+                heuristic_count += 1
+        logger.warning(
+            "Gemini unavailable; %d/%d postings scored by keyword heuristic",
+            heuristic_count,
+            len(jobs),
+        )
 
     matches: list[dict] = []
     dropped_low, dropped_area = 0, 0
