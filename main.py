@@ -110,7 +110,13 @@ def _describe(node: str, update: dict[str, Any]) -> str:
         top = ", ".join(
             f"{m.get('title', '?')} ({m.get('match_score', 0)}%)" for m in matches[:3]
         )
-        return f"{len(matches)} matches >= threshold" + (f" | top: {top}" if top else "")
+        mode = update.get("scoring_mode")
+        mode_note = f" | scoring: {mode}" if mode and mode != "llm" else ""
+        return (
+            f"{len(matches)} matches >= threshold"
+            + (f" | top: {top}" if top else "")
+            + mode_note
+        )
     if node == "mailer":
         return str(update.get("email_status") or "no status")
     if update.get("error"):

@@ -627,6 +627,8 @@ def searcher(
         len(state["raw_jobs"]),
         ", ".join(f"{k}={v}" for k, v in skipped.items() if v) or "none",
     )
+    for job in state["raw_jobs"]:
+        logger.info("Kept: %r (%s)", job["title"], job["url"])
     return state
 
 
@@ -867,6 +869,14 @@ def matcher(
 
     matches.sort(key=lambda item: item["match_score"], reverse=True)
     state["matches"] = matches
+    if not jobs:
+        state["scoring_mode"] = "none"
+    elif heuristic_count == len(jobs):
+        state["scoring_mode"] = "heuristic"
+    elif heuristic_count:
+        state["scoring_mode"] = "mixed"
+    else:
+        state["scoring_mode"] = "llm"
     if jobs and not scores:
         state["error"] = "matcher: no postings could be scored"
         logger.error("%s", state["error"])
@@ -894,15 +904,21 @@ def mailer(
     matches = state.get("matches") or []
     date_label = _date_label()
     roles = state.get("target_roles") or cfg.target_roles
+    degraded = state.get("scoring_mode") in ("heuristic", "mixed")
 
     if matches:
         html_body = email_service.render_matches_email(
-            matches, date_label=date_label, roles=roles
+            matches, date_label=date_label, roles=roles, degraded=degraded
         )
         subject = f"[Job Agent] {date_label}: {len(matches)} match{'es' if len(matches) != 1 else ''}"
     else:
-        html_body = email_service.render_empty_email(date_label, roles)
-        subject = f"[Job Agent] {date_label}: no high-confidence roles"
+        html_body = email_service.render_empty_email(
+            date_label, roles, degraded=degraded
+        )
+        if degraded:
+            subject = f"[Job Agent] {date_label}: no matches (degraded scoring)"
+        else:
+            subject = f"[Job Agent] {date_label}: no high-confidence roles"
 
     try:
         state["email_status"] = email_service.send_email(

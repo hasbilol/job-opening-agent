@@ -54,7 +54,20 @@ def _skill_list(skills: list[str]) -> str:
     return "".join(chips)
 
 
-def render_matches_email(matches: list[dict], *, date_label: str, roles: str) -> str:
+def _degraded_note() -> str:
+    return (
+        '<div style="padding:12px 32px;background:#fef3c7;border-bottom:1px solid #fcd34d;'
+        'font-size:13px;color:#92400e;">'
+        "Gemini's daily quota was exhausted today, so scores come from a keyword-overlap "
+        "heuristic rather than a full fit analysis. Tomorrow's digest will be back to "
+        "LLM scoring."
+        "</div>"
+    )
+
+
+def render_matches_email(
+    matches: list[dict], *, date_label: str, roles: str, degraded: bool = False
+) -> str:
     """Render scored matches into a modern, self-contained HTML document."""
     rows = []
     for job in matches:
@@ -141,6 +154,7 @@ def render_matches_email(matches: list[dict], *, date_label: str, roles: str) ->
             <strong>{_esc(summary)}</strong> &middot; scores are 0&ndash;100 with 70 as the cut-off.
           </td>
         </tr>
+        {_degraded_note() if degraded else ""}
         <tr><td style="padding:0 32px;">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{body_rows}</table>
         </td></tr>
@@ -156,8 +170,22 @@ def render_matches_email(matches: list[dict], *, date_label: str, roles: str) ->
 </html>"""
 
 
-def render_empty_email(date_label: str, roles: str) -> str:
+def render_empty_email(date_label: str, roles: str, degraded: bool = False) -> str:
     """Render the 'nothing found today' notification."""
+    if degraded:
+        body = (
+            "No roles cleared the match threshold today for "
+            f"<strong>{_esc(roles)}</strong>. Gemini's daily quota was exhausted, "
+            "so postings were scored with a keyword-overlap heuristic instead of the "
+            "full fit analysis &mdash; strong matches may have been missed. "
+            "Tomorrow's digest will be back to LLM scoring."
+        )
+    else:
+        body = (
+            "No high-confidence roles were found today for "
+            f"<strong>{_esc(roles)}</strong>. "
+            "The agent is resuming normal scanning &mdash; check back tomorrow."
+        )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"></head>
@@ -170,8 +198,7 @@ def render_empty_email(date_label: str, roles: str) -> str:
           <div style="font-size:13px;color:#9ca3af;margin-top:4px;">{date_label}</div>
         </td></tr>
         <tr><td style="padding:28px 32px;font-size:15px;line-height:1.6;color:#374151;">
-          No high-confidence roles were found today for <strong>{_esc(roles)}</strong>.
-          The agent is resuming normal scanning &mdash; check back tomorrow.
+          {body}
         </td></tr>
       </table>
     </td></tr>

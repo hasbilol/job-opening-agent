@@ -17,6 +17,9 @@ class JobHunterState(TypedDict, total=False):
             ``title``, ``url``, ``snippet``, ``source``.
         matches: Scored jobs with keys ``title``, ``url``, ``match_score``,
             ``rationale``, ``key_skills_matched``, ``missing_skills``.
+        scoring_mode: ``"llm"`` when Gemini scored the postings, ``"heuristic"``
+            when the keyword-overlap fallback had to be used (e.g. daily quota
+            exhausted), ``"none"`` when there was nothing to score.
         email_status: Human-readable outcome of the dispatch node.
         error: Populated when a node fails so downstream nodes can no-op.
     """
@@ -27,5 +30,6 @@ class JobHunterState(TypedDict, total=False):
     queries: list[str]
     raw_jobs: list[dict]
     matches: list[dict]
+    scoring_mode: str
     email_status: str
     error: str
