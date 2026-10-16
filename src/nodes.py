@@ -150,11 +150,12 @@ def _llm(settings: Settings, model_id: str | None = None) -> ChatGoogleGenerativ
 
 
 # Google retires Gemini models periodically (e.g. gemini-1.5-flash 404s, gemini-2.0-flash
-# shut down June 2026), so try the configured model first, then current flash models.
+# shut down June 2026, gemini-2.5-flash retired Oct 2026), so try the configured model
+# first, then current flash models.
 _MODEL_FALLBACKS = (
     "gemini-3.8-flash",
     "gemini-3.5-flash",
-    "gemini-2.5-flash",
+    "gemini-3.6-flash",
 )
 _active_model: str | None = None
 # The free tier also caps generate_content at 20 requests/DAY per model
@@ -162,6 +163,9 @@ _active_model: str | None = None
 # model that reports a hours-long retryDelay is dead for the day and the chain must
 # move on instead of sleeping; models known-dead this run are skipped outright.
 _quota_exhausted_models: set[str] = set()
+# Retired (404) models are skipped for the rest of the run too, so the matcher's
+# per-job loop does not re-discover the 404 on every single posting.
+_not_found_models: set[str] = set()
 # Hard per-run budget so the matcher's per-job fallback cannot burn the daily quota
 # on a single run (one request per job adds up fast).
 _DAILY_REQUEST_BUDGET = max(1, int(os.getenv("GEMINI_REQUEST_BUDGET", "16")))
@@ -228,13 +232,19 @@ def _is_daily_quota(exc: Exception) -> bool:
 def _is_quota_exhausted(exc: Exception) -> bool:
     """Daily quota gone for every model, or our own per-run budget spent."""
     text = str(exc).lower()
-    return _is_daily_quota(exc) or "budget exhausted" in text or "no usable gemini" in text
+    return (
+        _is_daily_quota(exc)
+        or "budget exhausted" in text
+        or "no usable gemini" in text
+        or "all gemini models are unavailable" in text
+    )
 
 
 def _candidate_models(settings: Settings) -> list[str]:
+    dead = _quota_exhausted_models | _not_found_models
     candidates: list[str] = []
     for model_id in (_active_model, settings.gemini_model, *_MODEL_FALLBACKS):
-        if model_id and model_id not in candidates and model_id not in _quota_exhausted_models:
+        if model_id and model_id not in candidates and model_id not in dead:
             candidates.append(model_id)
     return candidates
 
@@ -245,7 +255,9 @@ def _generate(settings: Settings, messages: list) -> Any:
 
     _acquire_request_slot()
     if not _candidate_models(settings):
-        raise RuntimeError("all Gemini models have exhausted their daily quota")
+        raise RuntimeError(
+            "all Gemini models are unavailable (retired or daily quota exhausted)"
+        )
 
     last_error: Exception | None = None
     for model_id in _candidate_models(settings):
@@ -254,8 +266,9 @@ def _generate(settings: Settings, messages: list) -> Any:
                 response = _llm(settings, model_id).invoke(messages)
             except Exception as exc:  # noqa: BLE001 - decide fallback by error text
                 if _is_model_not_found(exc):
+                    _not_found_models.add(model_id)
                     logger.warning(
-                        "Gemini model %s unavailable, trying next: %s", model_id, exc
+                        "Gemini model %s retired, trying next: %s", model_id, exc
                     )
                     last_error = exc
                     break
@@ -288,7 +301,12 @@ def _generate(settings: Settings, messages: list) -> Any:
                 return response
         continue
 
-    raise last_error or RuntimeError("no usable Gemini model found")
+    # Reaching here means every candidate failed via 404 or daily quota; anything
+    # else raised immediately above. Raise one recognizable error so callers can
+    # switch to fallbacks without pattern-matching the last raw exception.
+    raise RuntimeError(
+        "all Gemini models are unavailable (retired or daily quota exhausted)"
+    ) from last_error
 
 
 def _fallback_queries(target_roles: str, target_locations: str) -> list[str]:
