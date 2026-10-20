@@ -58,9 +58,9 @@ def _degraded_note() -> str:
     return (
         '<div style="padding:12px 32px;background:#fef3c7;border-bottom:1px solid #fcd34d;'
         'font-size:13px;color:#92400e;">'
-        "Gemini's daily quota was exhausted today, so scores come from a keyword-overlap "
-        "heuristic rather than a full fit analysis. Tomorrow's digest will be back to "
-        "LLM scoring."
+        "Gemini was unavailable for most of the run today (API timeouts, high demand, "
+        "or daily quota exhausted), so scores come from a keyword-overlap heuristic rather "
+        "than a full fit analysis. Tomorrow&rsquo;s digest will retry LLM scoring."
         "</div>"
     )
 
@@ -175,10 +175,11 @@ def render_empty_email(date_label: str, roles: str, degraded: bool = False) -> s
     if degraded:
         body = (
             "No roles cleared the match threshold today for "
-            f"<strong>{_esc(roles)}</strong>. Gemini's daily quota was exhausted, "
-            "so postings were scored with a keyword-overlap heuristic instead of the "
-            "full fit analysis &mdash; strong matches may have been missed. "
-            "Tomorrow's digest will be back to LLM scoring."
+            f"<strong>{_esc(roles)}</strong>. Gemini was unavailable for most of the run "
+            "(API timeouts, high demand, or daily quota exhausted), so postings were "
+            "scored with a keyword-overlap heuristic instead of the full fit analysis "
+            "&mdash; strong matches may have been missed. Tomorrow's digest will retry "
+            "LLM scoring."
         )
     else:
         body = (

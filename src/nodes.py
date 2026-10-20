@@ -144,7 +144,8 @@ def _llm(settings: Settings, model_id: str | None = None) -> ChatGoogleGenerativ
         model=model_id or settings.gemini_model,
         temperature=MODEL_TEMPERATURE,
         api_key=settings.gemini_api_key,
-        timeout=60,
+        # Free-tier responses regularly exceed 60s and then 504; give them room.
+        timeout=90,
         max_retries=0,
     )
 
@@ -191,19 +192,32 @@ _MAX_RATE_LIMIT_SLEEP = 45.0
 
 
 def _rate_limit_delay(exc: Exception) -> float | None:
-    """Seconds to wait for a 429/503, or None if the error is not rate limiting.
+    """Seconds to wait before retrying, or None if the error is not transient.
 
-    Gemini's free tier caps generate_content at ~5 requests/minute, which the
-    batch-then-per-job matcher can exceed. Honoring the server's retryDelay lets
-    the run finish instead of scoring nothing.
+    Covers rate limits (429 with a server retryDelay) AND the free tier's
+    chronic instability: 503 "high demand", 504 gateway timeouts, 500 internals
+    and client read timeouts. Observed on gemini free tier around 03-04 UTC:
+    runs where every call 503/504s and nothing 429s.
     """
     text = str(exc)
-    if not ("429" in text or "RESOURCE_EXHAUSTED" in text or "503" in text or "UNAVAILABLE" in text):
+    transient = (
+        "429" in text
+        or "RESOURCE_EXHAUSTED" in text
+        or "503" in text
+        or "UNAVAILABLE" in text
+        or "504" in text
+        or "DEADLINE_EXCEEDED" in text
+        or "500" in text and "INTERNAL" in text
+        or "timed out" in text.lower()
+        or "timeout" in text.lower()
+    )
+    if not transient:
         return None
     match = _RETRY_AFTER_RE.search(text)
     if match:
         return min(float(match.group(1)) + 1.0, _MAX_RATE_LIMIT_SLEEP)
-    return 10.0
+    # 503/504/timeout messages carry no retryDelay; a short fixed backoff is enough.
+    return 15.0
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -786,28 +800,45 @@ def matcher(
 
     cfg = _resolve(settings)
     jobs: list[dict] = state["raw_jobs"]
-    expected_ids = set(range(len(jobs)))
     locations = state.get("target_locations") or cfg.target_locations
     signals = _location_signals(locations)
     remote_ok = _remote_allowed(locations)
 
     scores: dict[int, JobMatchScore] = {}
-    try:
-        response = _message_text(
-            _generate(
-                cfg, _scoring_messages(state.get("resume_text", ""), jobs, locations)
+    # Score in small chunks: one flaky 503/504 call then only loses that chunk,
+    # and each prompt stays small enough for the free tier to answer quickly.
+    batch_size = 5
+    for start in range(0, len(jobs), batch_size):
+        chunk = jobs[start : start + batch_size]
+        try:
+            response = _message_text(
+                _generate(
+                    cfg,
+                    _scoring_messages(state.get("resume_text", ""), chunk, locations),
+                )
             )
-        )
-        scores = _parse_scores(response, expected_ids)
-        if len(scores) < len(jobs):
-            raise ValueError(f"batch scored {len(scores)}/{len(jobs)} jobs")
-    except Exception as exc:
-        if _is_quota_exhausted(exc):
-            logger.warning("Batch scoring skipped, Gemini quota exhausted: %s", exc)
-            scores = {}
-        else:
-            logger.warning("Batch scoring unavailable (%s); retrying per job", exc)
-            scores = {}
+            parsed = _parse_scores(response, set(range(len(chunk))))
+        except Exception as exc:
+            if _is_quota_exhausted(exc):
+                logger.warning("Batch scoring stopped, Gemini unavailable: %s", exc)
+                break
+            logger.warning(
+                "Batch chunk %d-%d failed (%s); retrying those jobs individually",
+                start,
+                start + len(chunk) - 1,
+                exc,
+            )
+            continue
+        for local_id, score in parsed.items():
+            scores[start + local_id] = score
+        if len(parsed) < len(chunk):
+            logger.warning(
+                "Batch chunk %d-%d scored %d/%d; rest go per-job",
+                start,
+                start + len(chunk) - 1,
+                len(parsed),
+                len(chunk),
+            )
 
     stop_per_job = False
     for index, job in enumerate(jobs):
